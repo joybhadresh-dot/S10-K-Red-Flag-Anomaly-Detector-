@@ -1,105 +1,103 @@
+"""
+SEC 10-K "Red Flag" Anomaly Detector
+Save as: app.py
+"""
+
 import streamlit as st
 import requests
 import re
 import time
-import logging
-from typing import List, Optional
 import pandas as pd
 from bs4 import BeautifulSoup
 from sentence_transformers import SentenceTransformer, util
 import openai
 import nltk
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+# Ensure NLTK tokenizers are downloaded silently to prevent runtime crashes
+for package in ['punkt', 'punkt_tab']:
+    try:
+        nltk.data.find(f'tokenizers/{package}')
+    except LookupError:
+        nltk.download(package, quiet=True)
 
-# Ensure NLTK tokenizers are available silently
-try:
-    nltk.data.find('tokenizers/punkt')
-except LookupError:
-    nltk.download('punkt', quiet=True)
-
-# ==========================================
-# 1. SEC EDGAR Data Ingestion Layer
-# ==========================================
-class SECRateLimiter:
-    """Enforces the SEC's strict 10 requests/second limit. We target 8/sec for safety."""
-    def __init__(self, max_per_second: int = 8):
-        self.min_interval = 1.0 / max_per_second
-        self.last_request_time = 0.0
-
-    def wait(self):
-        elapsed = time.time() - self.last_request_time
-        if elapsed < self.min_interval:
-            time.sleep(self.min_interval - elapsed)
-        self.last_request_time = time.time()
-
+# ---------------------------------------------------------
+# 1. SEC Data Fetching & Rate Limiting
+# ---------------------------------------------------------
 class SECFetcher:
     def __init__(self, user_agent: str):
-        """SEC requires: 'CompanyName AdminContact@domain.com'"""
-        if "@" not in user_agent:
-            raise ValueError("SEC EDGAR requires a valid email in the User-Agent header.")
+        # The SEC strict requirement: "User-Agent" must contain your Name and Email
         self.headers = {"User-Agent": user_agent, "Accept-Encoding": "gzip, deflate"}
-        self.limiter = SECRateLimiter()
+        self.session = requests.Session()
+        self.session.headers.update(self.headers)
+        self.last_request_time = 0.0
 
-    def _get(self, url: str) -> requests.Response:
-        """Internal wrapper to enforce rate limits and handle 403/429s."""
-        self.limiter.wait()
-        response = requests.get(url, headers=self.headers, timeout=15)
-        response.raise_for_status()
-        return response
+    def _rate_limit(self):
+        """Enforces a max of 8 requests / second (SEC limit is 10/sec)."""
+        elapsed = time.time() - self.last_request_time
+        if elapsed < 0.125:
+            time.sleep(0.125 - elapsed)
+        self.last_request_time = time.time()
 
-    def get_cik_from_ticker(self, ticker: str) -> str:
+    def get_cik(self, ticker: str) -> str:
+        self._rate_limit()
         url = "https://www.sec.gov/files/company_tickers.json"
-        data = self._get(url).json()
-        for _, value in data.items():
-            if value['ticker'].upper() == ticker.upper():
-                return str(value['cik_str']).zfill(10)
-        raise ValueError(f"Ticker {ticker} not found.")
+        resp = self.session.get(url, timeout=10)
+        resp.raise_for_status()
+        for _, v in resp.json().items():
+            if v['ticker'].upper() == ticker.upper():
+                return str(v['cik_str']).zfill(10)
+        raise ValueError(f"Ticker '{ticker}' not found in SEC EDGAR database.")
 
-    def get_recent_10k_urls(self, cik: str, count: int = 2) -> List[str]:
+    def get_last_two_10k_urls(self, cik: str):
+        self._rate_limit()
         url = f"https://data.sec.gov/submissions/CIK{cik}.json"
-        filings = self._get(url).json()['filings']['recent']
+        resp = self.session.get(url, timeout=10)
+        resp.raise_for_status()
+        filings = resp.json()['filings']['recent']
         
         urls = []
         for i, form in enumerate(filings['form']):
             if form == '10-K':
-                accession_no_clean = filings['accessionNumber'][i].replace("-", "")
-                document = filings['primaryDocument'][i]
-                urls.append(f"https://www.sec.gov/Archives/edgar/data/{cik}/{accession_no_clean}/{document}")
-                if len(urls) == count:
+                # Reformat the accession number by removing dashes for the URL path
+                acc_no_clean = filings['accessionNumber'][i].replace("-", "")
+                doc = filings['primaryDocument'][i]
+                urls.append(f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc_no_clean}/{doc}")
+                if len(urls) == 2:
                     break
         return urls
 
     def extract_item_1a(self, url: str) -> str:
-        response = self._get(url)
-        soup = BeautifulSoup(response.content, "html.parser")
+        self._rate_limit()
+        resp = self.session.get(url, timeout=15)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.content, "html.parser")
         text = re.sub(r'\s+', ' ', soup.get_text(separator=" "))
         
-        # Regex capturing Item 1A to Item 1B
+        # Regex capturing Item 1A (Risk Factors) and stopping before Item 1B or 2
         pattern = re.compile(r'ITEM\s+1A\.\s*RISK\s+FACTORS(.*?)(?:ITEM\s+1B\.\s*UNRESOLVED|ITEM\s+2\.\s*PROPERTIES)', re.IGNORECASE)
         matches = pattern.findall(text)
         
         if not matches:
             return ""
+        # We take the longest match to avoid accidentally grabbing the Table of Contents mention
         return max(matches, key=len).strip()
 
-# ==========================================
-# 2. Caching Wrappers for UI Performance
-# ==========================================
+# ---------------------------------------------------------
+# 2. Caching & Core ML Logic Wrappers
+# ---------------------------------------------------------
 @st.cache_data(show_spinner=False, ttl=86400)
 def fetch_sec_data(ticker: str, user_agent: str):
-    """Caches the SEC network calls so UI interactions don't trigger re-downloads."""
+    """Caches SEC fetching so the app doesn't redownload files if you tweak UI sliders."""
     fetcher = SECFetcher(user_agent)
-    cik = fetcher.get_cik_from_ticker(ticker)
-    urls = fetcher.get_recent_10k_urls(cik, count=2)
+    cik = fetcher.get_cik(ticker)
+    urls = fetcher.get_last_two_10k_urls(cik)
     if len(urls) < 2:
         raise ValueError("Could not find two consecutive 10-Ks.")
     return fetcher.extract_item_1a(urls[0]), fetcher.extract_item_1a(urls[1])
 
 @st.cache_resource(show_spinner=False)
 def load_embedding_model():
-    """Loads the ML model once and keeps it in memory."""
+    """Loads the sentence embedding model into memory once."""
     return SentenceTransformer('all-MiniLM-L6-v2')
 
 @st.cache_data(show_spinner=False)
@@ -118,10 +116,14 @@ def compute_semantic_diff(prior_text: str, current_text: str, threshold: float) 
     net_new = []
     for i, sent in enumerate(current_sents):
         max_score = cosine_scores[i].max().item()
+        # Only keep sentences below our similarity threshold (i.e., NOT boilerplate)
         if max_score < threshold and len(sent.split()) > 6:
             net_new.append({"Sentence": sent, "Similarity": round(max_score, 3)})
 
-    return pd.DataFrame(net_new).sort_values(by="Similarity")
+    df = pd.DataFrame(net_new)
+    if not df.empty:
+        df = df.sort_values(by="Similarity").reset_index(drop=True)
+    return df
 
 @st.cache_data(show_spinner=False)
 def generate_llm_analysis(delta_df: pd.DataFrame, api_key: str) -> str:
@@ -129,49 +131,60 @@ def generate_llm_analysis(delta_df: pd.DataFrame, api_key: str) -> str:
         return "No material net-new risks detected."
         
     client = openai.OpenAI(api_key=api_key)
+    # Take the top 30 most unique sentences to avoid LLM context overflow
     text_block = " ".join(delta_df['Sentence'].tolist()[:30])
     
     prompt = f"""
-    Analyze these net-new 10-K risk factor disclosures. 
+    Analyze these net-new 10-K risk factor disclosures isolated via semantic diffing.
     1. Categorize the main new risks.
-    2. Assign a Severity Score (1-10) based on cash flow impact.
-    3. Provide a 3-bullet executive summary.
+    2. Assign a Severity Score (1-10) based on potential cash flow impact.
+    3. Provide a 3-bullet executive summary of what management is newly worried about.
     Disclosures: {text_block}
     """
     
     response = client.chat.completions.create(
         model="gpt-4o",
         messages=[
-            {"role": "system", "content": "You are a precise hedge fund analyst."},
+            {"role": "system", "content": "You are a precise hedge fund quantitative analyst."},
             {"role": "user", "content": prompt}
         ],
         temperature=0.2
     )
     return response.choices[0].message.content
 
-# ==========================================
-# 3. Streamlit UI
-# ==========================================
+# ---------------------------------------------------------
+# 3. Streamlit Application UI
+# ---------------------------------------------------------
 def main():
-    st.set_page_config(page_title="10-K Anomaly Detector", layout="wide")
+    st.set_page_config(page_title="10-K Anomaly Detector", layout="wide", page_icon="📈")
     st.title("SEC 10-K 'Red Flag' Anomaly Detector 🚩")
 
     with st.sidebar:
         st.header("Configuration")
-        openai_key = st.text_input("OpenAI API Key", type="password")
-        sec_user_agent = st.text_input("SEC User Agent (Requires Email)", value="YourName contact@domain.com")
-        ticker = st.text_input("Target Ticker (e.g., TSLA)").upper()
-        threshold = st.slider("Boilerplate Similarity Threshold", 0.70, 0.99, 0.85, 0.01)
+        
+        # Check Streamlit secrets first, otherwise prompt the user
+        if "OPENAI_API_KEY" in st.secrets:
+            openai_key = st.secrets["OPENAI_API_KEY"]
+            st.success("OpenAI Key loaded securely.")
+        else:
+            openai_key = st.text_input("OpenAI API Key", type="password", help="Required for GPT-4o analysis.")
+            
+        sec_user_agent = st.text_input("SEC User Agent (Email Required)", value="QuantTeam your-email@domain.com")
+        ticker = st.text_input("Target Ticker (e.g., TSLA, META, NVDA)").upper()
+        threshold = st.slider("Similarity Threshold", 0.70, 0.99, 0.85, 0.01, help="Sentences with similarity below this score are flagged as new anomalies.")
+        
         run_btn = st.button("Run Analysis", type="primary")
 
     if run_btn:
         if not ticker or not openai_key or "@" not in sec_user_agent:
-            st.error("Please provide Ticker, OpenAI Key, and a valid SEC User Agent (must include email).")
+            st.error("Please provide Ticker, OpenAI Key, and a valid SEC User Agent (must include an email address).")
             return
 
         try:
             with st.spinner('1/3 Fetching and parsing SEC EDGAR filings...'):
                 current_text, prior_text = fetch_sec_data(ticker, sec_user_agent)
+                if len(current_text) < 100 or len(prior_text) < 100:
+                    st.warning("⚠️ Warning: Could not cleanly extract Item 1A. The SEC format for this company may be non-standard.")
 
             with st.spinner('2/3 Running NLP Cosine Similarity...'):
                 df_delta = compute_semantic_diff(prior_text, current_text, threshold)
@@ -179,15 +192,23 @@ def main():
             with st.spinner('3/3 Generating AI Risk Report...'):
                 analysis = generate_llm_analysis(df_delta, openai_key)
 
+            # Display Metrics
             col1, col2 = st.columns([1, 1])
-            col1.metric("Current 10-K Sentences", len(nltk.sent_tokenize(current_text)))
-            col2.metric("Net-New Anomalies", len(df_delta), delta_color="inverse")
+            curr_sents = len(nltk.sent_tokenize(current_text)) if current_text else 0
+            col1.metric("Current 10-K Sentences (Total)", curr_sents)
+            col2.metric("Net-New Anomalies (Isolated)", len(df_delta), delta_color="inverse")
 
-            st.subheader("🤖 Analyst Report")
+            # Display Analyst Report
+            st.subheader("🤖 AI Analyst Report")
             st.info(analysis)
             
-            st.subheader("Raw Structural Delta")
-            st.dataframe(df_delta, use_container_width=True)
+            # Display Raw Data Frame
+            st.subheader("Raw Structural Delta (The 'Anomalies')")
+            if not df_delta.empty:
+                st.markdown("These sentences appear in the current 10-K but do not match anything in last year's filing above the similarity threshold.")
+                st.dataframe(df_delta, use_container_width=True)
+            else:
+                st.write("No significant structural anomalies found between the two filings.")
 
         except Exception as e:
             st.error(f"Execution Error: {str(e)}")
